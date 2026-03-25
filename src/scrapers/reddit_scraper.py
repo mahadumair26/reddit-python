@@ -1,4 +1,4 @@
-"""Reddit scraper implementation using old.reddit HTML."""
+"""Reddit scraper implementation using old.reddit HTML + reddit JSON for metadata."""
 
 from datetime import datetime, timezone
 from typing import Optional
@@ -6,7 +6,7 @@ from typing import Optional
 from src.config.settings import settings
 from src.models.comment import CommentsResponse
 from src.models.post import PostsResponse
-from src.models.subreddit import SubredditInfo
+from src.models.subreddit import SubredditInfo, SubredditRule
 from src.parsers.comment_parser import CommentParser
 from src.parsers.post_parser import PostParser
 from src.parsers.subreddit_parser import SubredditParser
@@ -93,22 +93,49 @@ class RedditScraper(BaseScraper):
         if cached:
             return SubredditInfo.model_validate(cached)
 
-        about_html = await self._request(
-            self._build_url(f"/r/{subreddit}/about/"),
-            use_cache=True,
-            cache_ttl=settings.CACHE_TTL_SUBREDDIT,
+        # Use reddit JSON endpoints for subreddit metadata (more stable than old.reddit HTML /about/).
+        about_url = f"https://www.reddit.com/r/{subreddit}/about.json"
+        about_payload = await self._request_json(
+            about_url, use_cache=True, cache_ttl=settings.CACHE_TTL_SUBREDDIT
         )
-        about_soup = self._parse_html(about_html)
-        info = self.subreddit_parser.parse_subreddit_info(about_soup, subreddit=subreddit)
+        data = (about_payload or {}).get("data") or {}
 
-        rules_html = await self._request(
-            self._build_url(f"/r/{subreddit}/about/rules/"),
-            use_cache=True,
-            cache_ttl=settings.CACHE_TTL_SUBREDDIT,
+        created_utc = None
+        created_utc_ts = data.get("created_utc")
+        if isinstance(created_utc_ts, (int, float)):
+            created_utc = datetime.fromtimestamp(created_utc_ts, tz=timezone.utc)
+
+        info = SubredditInfo(
+            name=subreddit,
+            display_name=data.get("display_name") or subreddit,
+            title=data.get("title") or f"r/{subreddit}",
+            description=data.get("public_description") or data.get("description") or None,
+            subscribers=int(data.get("subscribers") or 0),
+            active_users=data.get("active_user_count"),
+            created_utc=created_utc,
+            is_nsfw=bool(data.get("over18") or False),
+            rules=[],
+            scraped_at=datetime.now(tz=timezone.utc),
         )
-        rules_soup = self._parse_html(rules_html)
-        info.rules = self.subreddit_parser.parse_rules(rules_soup)
-        info.scraped_at = datetime.now(tz=timezone.utc)
+
+        rules_url = f"https://www.reddit.com/r/{subreddit}/about/rules.json"
+        rules_payload = await self._request_json(
+            rules_url, use_cache=True, cache_ttl=settings.CACHE_TTL_SUBREDDIT
+        )
+        rules_list = (rules_payload or {}).get("rules") or []
+        parsed_rules: list[SubredditRule] = []
+        for idx, rule in enumerate(rules_list):
+            if not isinstance(rule, dict):
+                continue
+            parsed_rules.append(
+                SubredditRule(
+                    short_name=rule.get("short_name") or f"Rule {idx+1}",
+                    description=rule.get("description"),
+                    violation_reason=rule.get("violation_reason"),
+                    priority=int(rule.get("priority") or (idx + 1)),
+                )
+            )
+        info.rules = parsed_rules
 
         await cache.set(cache_key, info.model_dump(mode="json"), ttl=settings.CACHE_TTL_SUBREDDIT)
         return info

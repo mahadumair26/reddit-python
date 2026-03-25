@@ -73,6 +73,49 @@ class BaseScraper(ABC):
 
         return ""
 
+    async def _request_json(
+        self,
+        url: str,
+        params: Optional[dict[str, Any]] = None,
+        use_cache: bool = True,
+        cache_ttl: int = 3600,
+    ) -> dict[str, Any]:
+        """Fetch JSON URL with retries, jitter limiter, and optional cache."""
+        if not self.client:
+            await self.connect()
+        assert self.client is not None
+
+        cache_key = f"scraper_json:{url}:{params}"
+        if use_cache:
+            cached = await cache.get(cache_key)
+            if isinstance(cached, dict):
+                return cached
+
+        async for attempt in AsyncRetrying(
+            stop=stop_after_attempt(self.max_retries),
+            wait=wait_exponential(multiplier=1, min=1, max=10),
+            retry=retry_if_exception_type((httpx.HTTPError, httpx.TimeoutException, ValueError)),
+            reraise=True,
+        ):
+            with attempt:
+                await rate_limiter.acquire()
+                response = await self.client.get(
+                    url,
+                    params=params,
+                    headers={
+                        "User-Agent": pick_user_agent(),
+                        "Accept": "application/json,text/plain;q=0.9,*/*;q=0.8",
+                        "Accept-Language": "en-US,en;q=0.8",
+                    },
+                )
+                response.raise_for_status()
+                payload = response.json()
+                if use_cache and response.status_code == 200:
+                    await cache.set(cache_key, payload, ttl=cache_ttl)
+                return payload
+
+        return {}
+
     @staticmethod
     def _parse_html(html: str) -> BeautifulSoup:
         return BeautifulSoup(html, "lxml")
