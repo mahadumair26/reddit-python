@@ -43,3 +43,18 @@ app.add_middleware(
 )
 register_middleware(app)
 app.include_router(router, prefix=settings.API_PREFIX, tags=["reddit-scraper"])
+
+
+def _require_port() -> int:
+    import os
+
+    port = os.environ.get("PORT")
+    if not port:
+        raise RuntimeError("PORT environment variable is required (Railway provides this).")
+    return int(port)
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("src.main:app", host="0.0.0.0", port=_require_port())
