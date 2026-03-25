@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, Query
 
 from src.api.dependencies import get_reddit_scraper
 from src.models import CommentsResponse, PostsResponse, SubredditInfo
+from src.models.agent_post import AgentPostsResponse, posts_response_to_agent
 from src.scrapers.reddit_scraper import RedditScraper
 
 router = APIRouter()
@@ -26,6 +27,27 @@ async def get_subreddit_posts(
     scraper: RedditScraper = Depends(get_reddit_scraper),
 ) -> PostsResponse:
     return await scraper.get_subreddit_posts(name, sort_by=sort_by, time_filter=time_filter, limit=limit)
+
+
+@router.get(
+    "/subreddit/{name}/posts/agent",
+    response_model=AgentPostsResponse,
+    response_model_by_alias=True,
+)
+async def get_subreddit_posts_agent(
+    name: str,
+    sort_by: str = Query(default="hot", pattern="^(hot|new|top|rising)$"),
+    time_filter: Optional[str] = Query(default=None, pattern="^(hour|day|week|month|year|all)$"),
+    limit: int = Query(default=25, ge=1, le=100),
+    keyword: str = Query(default=""),
+    id_offset: int = Query(default=0, ge=0, description="Added to sequential id for pagination"),
+    scraper: RedditScraper = Depends(get_reddit_scraper),
+) -> AgentPostsResponse:
+    """Same data as /posts, shaped for the main Reddit agent (camelCase, no relevanceScore)."""
+    pr = await scraper.get_subreddit_posts(
+        name, sort_by=sort_by, time_filter=time_filter, limit=limit
+    )
+    return posts_response_to_agent(pr, keyword=keyword, id_offset=id_offset)
 
 
 @router.get("/post/{post_id}", response_model=CommentsResponse)

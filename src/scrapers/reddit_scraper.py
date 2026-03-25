@@ -1,11 +1,11 @@
-"""Reddit scraper implementation using old.reddit HTML + reddit JSON for metadata."""
+"""Reddit scraper implementation using old.reddit HTML + reddit JSON for subreddit metadata."""
 
 from datetime import datetime, timezone
 from typing import Optional
 
 from src.config.settings import settings
 from src.models.comment import CommentsResponse
-from src.models.post import PostsResponse
+from src.models.post import PostsResponse, RedditPost
 from src.models.subreddit import SubredditInfo, SubredditRule
 from src.parsers.comment_parser import CommentParser
 from src.parsers.post_parser import PostParser
@@ -36,7 +36,6 @@ class RedditScraper(BaseScraper):
         if cached:
             return PostsResponse.model_validate(cached)
 
-        # old.reddit uses /top/?t=<window> for time-scoped top posts.
         path = f"/r/{subreddit}/{sort_by}/"
         params = {"limit": safe_limit}
         if sort_by == "top" and time_filter:
@@ -50,6 +49,7 @@ class RedditScraper(BaseScraper):
         )
         soup = self._parse_html(html)
         posts = self.post_parser.parse_listing(soup, subreddit=subreddit, limit=safe_limit)
+        posts = await self._enrich_selftext_from_post_pages(posts, subreddit=subreddit)
 
         payload = PostsResponse(
             subreddit=subreddit,
@@ -61,6 +61,40 @@ class RedditScraper(BaseScraper):
         )
         await cache.set(cache_key, payload.model_dump(mode="json"), ttl=settings.CACHE_TTL_POSTS)
         return payload
+
+    async def _enrich_selftext_from_post_pages(
+        self,
+        posts: list[RedditPost],
+        subreddit: str,
+    ) -> list[RedditPost]:
+        """Fill selftext for self posts by fetching /comments/{id}/ when listing HTML has no body."""
+        max_fetch = settings.MAX_SELFTEXT_ENRICH_FETCH
+        if max_fetch <= 0:
+            return posts
+        enriched = 0
+        out: list[RedditPost] = []
+        for post in posts:
+            current = post
+            if (
+                post.is_self
+                and not (post.selftext and post.selftext.strip())
+                and enriched < max_fetch
+            ):
+                try:
+                    html = await self._request(
+                        self._build_url(f"/comments/{post.id}/"),
+                        use_cache=True,
+                        cache_ttl=settings.CACHE_TTL_POSTS,
+                    )
+                    soup = self._parse_html(html)
+                    single = self.post_parser.parse_single_post(soup, subreddit)
+                    if single and single.selftext and str(single.selftext).strip():
+                        current = post.model_copy(update={"selftext": single.selftext})
+                    enriched += 1
+                except Exception:
+                    pass
+            out.append(current)
+        return out
 
     async def get_post_comments(self, post_id: str, limit: int = 100) -> CommentsResponse:
         safe_limit = min(limit, settings.MAX_COMMENTS_PER_POST)

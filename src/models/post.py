@@ -11,11 +11,13 @@ class RedditPost(BaseModel):
     title: str
     author: str
     subreddit: str
-    url: HttpUrl
+    url: HttpUrl = Field(..., description="Canonical Reddit thread URL (discussion page)")
     permalink: str
 
     selftext: Optional[str] = None
-    link_url: Optional[HttpUrl] = None
+    link_url: Optional[HttpUrl] = Field(
+        None, description="Outbound link for link posts; null for text/self posts"
+    )
     is_self: bool
 
     score: int

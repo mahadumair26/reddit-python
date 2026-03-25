@@ -23,6 +23,7 @@ API docs: `http://localhost:8000/api/v1/docs`
 ## Current Endpoints
 - `GET /api/v1/health`
 - `GET /api/v1/subreddit/{name}/posts`
+- `GET /api/v1/subreddit/{name}/posts/agent` — same posts, **camelCase** shape for the main agent (`redditPostId`, `numComments`, `redditCreatedAt`, `foundAt`, optional `keyword`)
 - `GET /api/v1/post/{post_id}`
 - `GET /api/v1/subreddit/{name}/rules`
 

@@ -48,16 +48,37 @@ class PostParser:
                 permalink = comments_link.get("href", "") if comments_link else ""
             permalink = permalink if permalink.startswith("/r/") else f"/r/{subreddit}/comments/{post_id}/"
 
-            raw_url = element.get("data-url") or (title_elem.get("href", "") if title_elem else "")
-            if not raw_url.startswith("http"):
-                url = f"https://old.reddit.com{raw_url}" if raw_url.startswith("/") else f"https://old.reddit.com{permalink}"
-            else:
-                url = raw_url
+            # Canonical Reddit thread URL (what users expect as "the post URL").
+            reddit_post_url = (
+                f"https://www.reddit.com{permalink}" if permalink.startswith("/") else permalink
+            )
 
+            raw_url = element.get("data-url") or (title_elem.get("href", "") if title_elem else "")
             domain = element.get("data-domain")
             is_self = bool(domain and domain.startswith("self."))
-            selftext = None
-            link_url = None if is_self else url
+
+            # Link posts: data-url is the external article; keep it in link_url only.
+            # url is always the Reddit discussion page.
+            if is_self:
+                url = reddit_post_url
+                link_url = None
+            else:
+                url = reddit_post_url
+                if raw_url.startswith("http"):
+                    link_url = raw_url
+                elif raw_url.startswith("/"):
+                    link_url = f"https://old.reddit.com{raw_url}"
+                else:
+                    link_url = None
+
+            selftext: Optional[str] = None
+            expando = element.select_one("div.expando")
+            if expando:
+                md = expando.select_one("div.md")
+                if md:
+                    text = md.get_text("\n", strip=True)
+                    if text:
+                        selftext = text
 
             score_elem = element.select_one("div.score.unvoted") or element.select_one("div.score")
             score = self._parse_score(score_elem.get_text(strip=True) if score_elem else "0")

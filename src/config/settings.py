@@ -59,6 +59,8 @@ class Settings(BaseSettings):
 
     MAX_POSTS_PER_REQUEST: int = 100
     MAX_COMMENTS_PER_POST: int = 500
+    # Extra old.reddit HTML fetches for self posts missing body on listing (0 = disable).
+    MAX_SELFTEXT_ENRICH_FETCH: int = 25
 
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", case_sensitive=True, extra="ignore"

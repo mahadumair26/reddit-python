@@ -1,85 +1,168 @@
-# How This API Works
+# How the subreddit posts API works (detailed)
 
-Endpoint you called:
+This document explains **end-to-end** what happens when you call:
 
-`http://127.0.0.1:8000/api/v1/subreddit/Recruitment/posts?sort_by=hot&limit=25`
+```
+https://reddit-python-production.up.railway.app/api/v1/subreddit/technology/posts?sort_by=hot&limit=25
+```
 
-## 1) What this request means
+The same logic applies on any host (local Docker, Render, etc.); only the **base URL** changes.
 
-- `subreddit=Recruitment` comes from the path `/subreddit/Recruitment/posts`
-- `sort_by=hot` means fetch "hot" posts
-- `limit=25` means return up to 25 posts
+---
 
-Internally this maps to:
+## 1. What you are calling
 
-- Route: `GET /api/v1/subreddit/{name}/posts`
-- Handler function: `get_subreddit_posts(...)` in `src/api/routes.py`
-- Scraper method: `RedditScraper.get_subreddit_posts(...)` in `src/scrapers/reddit_scraper.py`
+| Piece | Value |
+|--------|--------|
+| **Method** | `GET` |
+| **Host** | Your deployed app (example: `reddit-python-production.up.railway.app`) |
+| **Path** | `/api/v1/subreddit/technology/posts` |
+| **Path parameter** | `technology` → subreddit name (without `r/`) |
+| **Query** | `sort_by=hot`, `limit=25` |
 
-## 2) Request validation (FastAPI)
+So the server receives:
 
-Before scraping starts, FastAPI validates query params:
+- **Subreddit**: `technology`
+- **Sort**: hot feed
+- **Max posts**: 25 (capped by config `MAX_POSTS_PER_REQUEST`, max 100 in the API)
 
-- `sort_by` must be one of: `hot | new | top | rising`
-- `time_filter` (optional) must be one of: `hour | day | week | month | year | all`
-- `limit` must be between `1` and `100`
+---
 
-So your call is valid:
+## 2. How the URL maps to code
 
-- `sort_by=hot` ✅
-- `limit=25` ✅
+The app is created in `src/main.py` and mounts routes under a prefix from settings (default `API_PREFIX=/api/v1`).
 
-## 3) End-to-end flow inside service
+The route is defined in `src/api/routes.py`:
 
-1. FastAPI receives the request in `src/main.py`.
-2. Router dispatches it to `get_subreddit_posts(...)` in `src/api/routes.py`.
-3. Dependency injection provides a singleton `RedditScraper` instance from `src/api/dependencies.py`.
-4. `RedditScraper.get_subreddit_posts(...)`:
-   - clamps limit with `MAX_POSTS_PER_REQUEST`
-   - checks Redis cache key:
-     - `posts:Recruitment:hot:None:25`
-   - if cache miss, builds old Reddit URL:
-     - `https://old.reddit.com/r/Recruitment/hot/`
-   - calls base scraper `_request(...)`
-5. `BaseScraper._request(...)` in `src/scrapers/base.py`:
-   - applies rate limiting (`rate_limiter.acquire()`)
-   - sends HTTP request with rotated user-agent
-   - retries on network/HTTP errors with exponential backoff
-   - stores HTML in cache when successful
-6. HTML is parsed by `PostParser.parse_listing(...)` in `src/parsers/post_parser.py`.
-7. Parsed posts are converted into `RedditPost` models and wrapped in `PostsResponse`.
-8. JSON response is returned to you.
+```20:28:src/api/routes.py
+@router.get("/subreddit/{name}/posts", response_model=PostsResponse)
+async def get_subreddit_posts(
+    name: str,
+    sort_by: str = Query(default="hot", pattern="^(hot|new|top|rising)$"),
+    time_filter: Optional[str] = Query(default=None, pattern="^(hour|day|week|month|year|all)$"),
+    limit: int = Query(default=25, ge=1, le=100),
+    scraper: RedditScraper = Depends(get_reddit_scraper),
+) -> PostsResponse:
+    return await scraper.get_subreddit_posts(name, sort_by=sort_by, time_filter=time_filter, limit=limit)
+```
 
-## 4) Response shape
+So for your URL:
 
-The endpoint returns a `PostsResponse` object:
+- `name` = `technology`
+- `sort_by` = `hot`
+- `time_filter` = omitted → `None`
+- `limit` = `25`
+
+FastAPI injects a shared `RedditScraper` instance via `get_reddit_scraper` (`src/api/dependencies.py`).
+
+---
+
+## 3. Validation (before any scraping)
+
+FastAPI validates query parameters **before** `get_subreddit_posts` runs:
+
+- **`sort_by`**: must match `hot`, `new`, `top`, or `rising` (regex on the route).
+- **`time_filter`** (optional): only used with `top`; must be `hour`, `day`, `week`, `month`, `year`, or `all` if provided.
+- **`limit`**: integer between **1** and **100**.
+
+Invalid values return **422 Unprocessable Entity** with a JSON error body (standard FastAPI validation).
+
+---
+
+## 4. What the scraper does (`RedditScraper.get_subreddit_posts`)
+
+Implementation: `src/scrapers/reddit_scraper.py`.
+
+### 4.1 Cache lookup (Redis)
+
+A cache key is built:
+
+```text
+posts:technology:hot:None:25
+```
+
+If Redis is connected and this key exists, the cached JSON is deserialized into `PostsResponse` and returned **without** hitting Reddit.
+
+If Redis is unavailable, cache reads/writes are skipped and the flow continues (fetch + parse).
+
+### 4.2 upstream request (old.reddit HTML listing)
+
+Production often **cannot** use Reddit’s public `*.json` listing (blocked or throttled for server IPs). This service therefore loads **HTML** from **old.reddit.com** (`REDDIT_BASE_URL`).
+
+For `sort_by=hot` and subreddit `technology`:
+
+- Path: `/r/technology/hot/`
+- Query: `limit=25`
+
+Example:
+
+```text
+https://old.reddit.com/r/technology/hot/?limit=25
+```
+
+For `sort_by=top` and `time_filter` set (e.g. `week`), the scraper adds `t=week`.
+
+### 4.3 HTTP client behavior (`BaseScraper._request`)
+
+In `src/scrapers/base.py`, `_request`:
+
+- Uses a shared **`httpx.AsyncClient`** (async).
+- Applies **rate limiting** (`rate_limiter.acquire()`) before each request.
+- Sends a **rotating User-Agent** (`pick_user_agent()`).
+- Retries on **HTTP/network errors** using **tenacity** (`AsyncRetrying`, exponential backoff).
+- Optionally caches the **raw HTML** in Redis under a key derived from URL + params.
+
+### 4.4 Parsing and selftext
+
+`PostParser.parse_listing` reads each post card from the listing HTML. **`selftext`** is taken from **`div.expando div.md`** when Reddit embeds it on the listing.
+
+If a **self post** still has no body (common), the scraper may fetch up to **`MAX_SELFTEXT_ENRICH_FETCH`** (default `10`) individual thread pages: `old.reddit.com/comments/{id}/`, parse the main post again, and copy **`selftext`**. This uses **HTML only** (no JSON listing). Set `MAX_SELFTEXT_ENRICH_FETCH=0` in env to disable extra fetches.
+
+### 4.5 Response assembly
+
+The scraper builds a **`PostsResponse`**:
+
+- `subreddit`: `technology`
+- `sort_by`: `hot`
+- `time_filter`: `null` if omitted
+- `posts`: list of `RedditPost`
+- `count`: actual number of posts parsed (can be **less than** `limit` if the page has fewer items)
+- `scraped_at`: UTC timestamp
+
+The result is written to Redis (if available) with TTL `CACHE_TTL_POSTS` (default 1 hour), then returned as **JSON** to the client.
+
+---
+
+## 5. JSON response shape
+
+The endpoint returns a JSON object matching `PostsResponse` + nested `RedditPost` models. Conceptually:
 
 ```json
 {
-  "subreddit": "Recruitment",
+  "subreddit": "technology",
   "sort_by": "hot",
   "time_filter": null,
   "posts": [
     {
-      "id": "...",
-      "title": "...",
-      "author": "...",
-      "subreddit": "Recruitment",
-      "url": "https://...",
-      "permalink": "/r/Recruitment/comments/...",
+      "id": "…",
+      "title": "…",
+      "author": "…",
+      "subreddit": "technology",
+      "url": "https://www.reddit.com/r/technology/comments/…",
+      "permalink": "/r/technology/comments/…",
       "selftext": null,
-      "link_url": "https://...",
+      "link_url": "https://external-site.com/article",
       "is_self": false,
       "score": 123,
       "upvote_ratio": null,
-      "num_comments": 10,
-      "created_utc": "2026-03-20T00:00:00+00:00",
+      "num_comments": 45,
+      "created_utc": "2026-01-01T12:00:00+00:00",
       "flair": null,
       "is_nsfw": false,
       "is_spoiler": false,
       "is_locked": false,
       "is_stickied": false,
-      "domain": "example.com",
+      "domain": "…",
       "thumbnail_url": null,
       "scraped_at": "2026-03-20T00:00:00+00:00"
     }
@@ -89,21 +172,56 @@ The endpoint returns a `PostsResponse` object:
 }
 ```
 
-## 5) Caching behavior
+OpenAPI docs (if enabled):  
+`https://reddit-python-production.up.railway.app/api/v1/docs`
 
-- Cache backend: Redis (`src/utils/cache.py`)
-- Posts TTL: `CACHE_TTL_POSTS` (default `3600` seconds = 1 hour)
-- If the same request is repeated within TTL, data is served from cache faster.
+### `url` vs `link_url` (important)
 
-## 6) Important notes
+On Reddit, most **r/technology** “hot” items are **link posts**: the big title usually opens the **article** (e.g. howtogeek.com), while **comments** open the Reddit thread.
 
-- This service scrapes `old.reddit.com` HTML, not official Reddit API.
-- Returned post count may be less than 25 if parser finds fewer valid post elements.
-- If Reddit blocks/rate-limits temporarily, retries/backoff run automatically.
+- **`url`** — Always the **Reddit discussion URL** (canonical `https://www.reddit.com/r/.../comments/...`). Use this when you want “open this post on Reddit.”
+- **`link_url`** — For link posts, the **external article** URL (same as Reddit’s `data-url`). For **text/self** posts, this is `null`.
+- **`permalink`** — Relative path only (e.g. `/r/technology/comments/1s39x77/...`); prepend `https://www.reddit.com` to match `url`.
 
-## 7) Quick test command
+Previously the parser put the external site in `url`; that matched Reddit’s listing `data-url` but is confusing if you expect “Reddit post URL.” The parser now matches the fields above.
+
+---
+
+## 6. Failure modes you might see
+
+| Situation | Typical result |
+|-----------|----------------|
+| Reddit returns 403/429/5xx | `httpx` raises after retries; your API may return **500** unless you add a global exception handler. |
+| Empty or changed HTML | Fewer posts or empty `posts`; not necessarily an HTTP error. |
+| Invalid query params | **422** from FastAPI. |
+| Redis down | Service still works; cache is skipped. |
+
+---
+
+## 7. How this differs from “subreddit rules”
+
+The **`/subreddit/{name}/rules`** endpoint uses **Reddit JSON** (`about.json` / `about/rules.json`) for metadata (may fail on some production IPs; subreddit info can still error).  
+The **posts** listing uses **old.reddit HTML** only.  
+**Comments** for a single post use **old.reddit HTML** (`/comments/{id}/`).
+
+---
+
+## 8. Example commands
+
+**Production (your Railway URL):**
 
 ```bash
-curl "http://127.0.0.1:8000/api/v1/subreddit/Recruitment/posts?sort_by=hot&limit=25"
+curl "https://reddit-python-production.up.railway.app/api/v1/subreddit/technology/posts?sort_by=hot&limit=25"
 ```
 
+**Local:**
+
+```bash
+curl "http://127.0.0.1:8000/api/v1/subreddit/technology/posts?sort_by=hot&limit=25"
+```
+
+**Health check:**
+
+```bash
+curl "https://reddit-python-production.up.railway.app/api/v1/health"
+```
