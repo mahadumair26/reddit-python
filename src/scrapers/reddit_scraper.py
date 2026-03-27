@@ -62,12 +62,32 @@ class RedditScraper(BaseScraper):
         await cache.set(cache_key, payload.model_dump(mode="json"), ttl=settings.CACHE_TTL_POSTS)
         return payload
 
+    @staticmethod
+    def _should_attempt_selftext_enrichment(post: RedditPost, subreddit: str) -> bool:
+        """Whether to fetch the comment page to try to fill selftext.
+
+        Self posts always may need body text from the thread page. Link posts usually have no
+        author body, but Reddit-hosted types (gallery, i.redd.it, old.reddit.com links, etc.)
+        often include optional author text in the same div.md as self posts — enrich those too.
+        """
+        if post.selftext and str(post.selftext).strip():
+            return False
+        if post.is_self:
+            return True
+        d = (post.domain or "").lower()
+        sub_l = subreddit.lower()
+        if d in ("old.reddit.com", "i.redd.it"):
+            return True
+        if d == f"self.{sub_l}":
+            return True
+        return False
+
     async def _enrich_selftext_from_post_pages(
         self,
         posts: list[RedditPost],
         subreddit: str,
     ) -> list[RedditPost]:
-        """Fill selftext for self posts by fetching /comments/{id}/ when listing HTML has no body."""
+        """Fill selftext by fetching /comments/{id}/ when listing HTML has no body (shared cap)."""
         max_fetch = settings.MAX_SELFTEXT_ENRICH_FETCH
         if max_fetch <= 0:
             return posts
@@ -75,11 +95,8 @@ class RedditScraper(BaseScraper):
         out: list[RedditPost] = []
         for post in posts:
             current = post
-            if (
-                post.is_self
-                and not (post.selftext and post.selftext.strip())
-                and enriched < max_fetch
-            ):
+            if self._should_attempt_selftext_enrichment(post, subreddit) and enriched < max_fetch:
+                enriched += 1
                 try:
                     html = await self._request(
                         self._build_url(f"/comments/{post.id}/"),
@@ -90,7 +107,6 @@ class RedditScraper(BaseScraper):
                     single = self.post_parser.parse_single_post(soup, subreddit)
                     if single and single.selftext and str(single.selftext).strip():
                         current = post.model_copy(update={"selftext": single.selftext})
-                    enriched += 1
                 except Exception:
                     pass
             out.append(current)
